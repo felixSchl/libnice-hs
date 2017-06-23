@@ -7,6 +7,7 @@ import Control.Applicative ((<$>))
 import Data.ByteString (ByteString, packCStringLen)
 import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.Word
+import Data.Tuple (swap)
 import Foreign.C
 import Foreign.ForeignPtr
 import Foreign.Marshal
@@ -15,6 +16,7 @@ import Foreign.Ptr
 import Foreign.Storable
 import Control.Concurrent
 import Control.Monad
+import Control.Arrow (first)
 
 import System.Glib.GObject
 import System.Glib.Properties
@@ -41,10 +43,9 @@ import Network.Ice.Utils
 
 type RecvFun = Ptr () -> CUInt -> CUInt -> CUInt -> Ptr CChar -> Ptr () -> IO ()
 
-data NiceAgent = NiceAgent {unNiceAgent  :: ForeignPtr NiceAgent } deriving Eq
+data NiceAgent = NiceAgent { unNiceAgent :: ForeignPtr NiceAgent } deriving Eq
 
-
-
+withNiceAgent :: NiceAgent -> (Ptr a -> IO b) -> IO b
 withNiceAgent (NiceAgent na ) f = withForeignPtr na $ f . castPtr
 
 instance GObjectClass NiceAgent where
@@ -53,11 +54,10 @@ instance GObjectClass NiceAgent where
 
 niceAgentNew :: Compatibility -> MainContext -> IO NiceAgent
 niceAgentNew compat ctx = withForeignPtr (fromMainContext ctx) $ \p ->
-                          constructNewGObject
-                        (NiceAgent, objectUnref)
+    constructNewGObject (NiceAgent, objectUnref)
                         (castPtr <$> {# call nice_agent_new #}
-                                 (castPtr p)
-                                 (fromIntegral $ fromEnum compat))
+                                (castPtr p)
+                                (fromIntegral $ fromEnum compat))
 
 -- nice_agent_add_local_address
 
@@ -69,16 +69,8 @@ niceAgentNew compat ctx = withForeignPtr (fromMainContext ctx) $ \p ->
 
 -- nice_agent_set_relay_info
 
--- | You HAVE to call 'attachReceive' before running this, otherwise stun messages
--- can't be received
 {# fun gather_candidates as ^
     {withNiceAgent* `NiceAgent', `Int'} -> `Bool' #}
-
-peekGString x = do
-  strp <- peek x
-  str <- peekCString strp
-  {#call g_free #} $ castPtr strp
-  return str
 
 {# fun set_remote_credentials as ^
     { withNiceAgent* `NiceAgent', `Int', `String', `String'} -> `Bool' #}
@@ -90,10 +82,6 @@ peekGString x = do
     , alloca- `String' peekGString* }
     -> `Bool' #}
 
-gsListify xs f = do
-  ptrs <- mapM new xs
-  withGSList ptrs f
-
 {# fun set_remote_candidates as ^
    { withNiceAgent* `NiceAgent'
    , `Int'
@@ -102,10 +90,6 @@ gsListify xs f = do
    }
    -> `Bool' #}
 
-unGsListify x = do
-  ptrs <- fromGSList x
-  mapM peek ptrs
-
 {# fun get_remote_candidates as ^
   { withNiceAgent* `NiceAgent'
   , `Int'
@@ -113,23 +97,12 @@ unGsListify x = do
   }
   -> `[NiceCandidate]' unGsListify* #}
 
-unGsListify' x = do
-  ptrs <- fromGSList x
-  mapM (\p ->do
-             x <- peek p
-             -- free p -- TODO: Why does this crash?
-             return x
-       )  ptrs
-
 {# fun get_local_candidates as ^
   { withNiceAgent* `NiceAgent'
   , `Int'
   , `Int'
   }
-  -> `[NiceCandidate]' unGsListify'* #}
-
-useAsCStringLen' bs f = unsafeUseAsCStringLen bs
-                           (f . \(x,y) -> (fromIntegral y,x))
+  -> `[NiceCandidate]' unGsListify* #}
 
 {# fun nice_agent_send as send
   { withNiceAgent* `NiceAgent'
@@ -139,12 +112,8 @@ useAsCStringLen' bs f = unsafeUseAsCStringLen bs
   }
   -> `Int' #}
 
-dataP = ($ nullPtr)
-
 foreign import ccall "wrapper"
     mkRecvFun :: RecvFun -> IO (FunPtr RecvFun)
-
-withMainContext ctx f  = withForeignPtr (fromMainContext ctx) $ f . castPtr
 
 {# fun attach_recv as niceAgentAttachRecv'
   { withNiceAgent* `NiceAgent'
@@ -156,6 +125,13 @@ withMainContext ctx f  = withForeignPtr (fromMainContext ctx) $ f . castPtr
   }
   -> `Bool' #}
 
+attachReceive
+    :: NiceAgent
+    -> Int
+    -> Int
+    -> MainContext
+    -> (ByteString -> IO ())
+    -> IO Bool
 attachReceive agent sid cid ctx f = do
   let f' _agent _sid _cid len buf _userData = do
               bs <- packCStringLen (buf, fromIntegral len)
@@ -187,6 +163,13 @@ attachReceive agent sid cid ctx f = do
   }
   -> `()' #}
 
+{# fun set_stream_name as ^
+  { withNiceAgent* `NiceAgent'
+  , `Int'
+  , `String'
+  }
+  -> `()' #}
+
 {# fun set_software as ^
   { withNiceAgent* `NiceAgent'
   , `String'
@@ -204,26 +187,25 @@ candidateGatheringDone :: Signal NiceAgent (Word -> IO ())
 candidateGatheringDone = Signal (connect_WORD__NONE "candidate-gathering-done")
 
 componentStateChanged :: Signal NiceAgent (Word -> Word -> Word -> IO ())
-componentStateChanged = Signal (connect_WORD_WORD_WORD__NONE
-                                  "component-state-changed")
+componentStateChanged = Signal (connect_WORD_WORD_WORD__NONE "component-state-changed")
 
 initialBindingrequestReceived ::Signal NiceAgent (Word -> IO ())
 initialBindingrequestReceived  = Signal (connect_WORD__NONE "initial-binding-request-received")
 
 newCandidate :: Signal NiceAgent (Word -> Word -> String -> IO ())
-newCandidate = Signal (connect_WORD_WORD_STRING__NONE
-                                      "new-candidate")
+newCandidate = Signal (connect_WORD_WORD_STRING__NONE "new-candidate")
+
+newCandidateFull :: Signal NiceAgent (NiceCandidate -> IO ())
+newCandidateFull = Signal (connect_PTR__NONE "new-candidate-full")
 
 newRemotecandidate :: Signal NiceAgent (Word -> Word -> String -> IO ())
-newRemotecandidate = Signal (connect_WORD_WORD_STRING__NONE
-                                      "new-remote-candidate")
+newRemotecandidate = Signal (connect_WORD_WORD_STRING__NONE "new-remote-candidate")
+
 newSelectedPair :: Signal NiceAgent (Word -> Word -> String -> String -> IO ())
-newSelectedPair = Signal (connect_WORD_WORD_STRING_STRING__NONE
-                                      "new-selected-pair")
+newSelectedPair = Signal (connect_WORD_WORD_STRING_STRING__NONE "new-selected-pair")
 
 reliableTransportWritable :: Signal NiceAgent (Word -> Word -> IO ())
-reliableTransportWritable = Signal (connect_WORD_WORD__NONE
-                                       "reliable-transport-writable")
+reliableTransportWritable = Signal (connect_WORD_WORD__NONE "reliable-transport-writable")
 
 -- Properties
 
@@ -239,17 +221,59 @@ fullMode = newAttrFromBoolProperty "full-mode"
 maxConnectivityChecks :: Attr NiceAgent Int
 maxConnectivityChecks = newAttrFromUIntProperty "max-connectivity-checks"
 
-proxyIp         = newAttrFromStringProperty "proxy-ip"
-proxyPassword   = newAttrFromStringProperty "proxy-password"
-proxyPort       = newAttrFromUIntProperty "proxy-port"
-proxyType       = newAttrFromUIntProperty "proxy-type"
-proxyUsername   = newAttrFromStringProperty "proxy-username"
-reliable        = newAttrFromBoolProperty "reliable"
+proxyIp :: Attr NiceAgent String
+proxyIp = newAttrFromStringProperty "proxy-ip"
+
+proxyPassword :: Attr NiceAgent String
+proxyPassword = newAttrFromStringProperty "proxy-password"
+
+proxyPort :: Attr NiceAgent Int
+proxyPort = newAttrFromUIntProperty "proxy-port"
+
+proxyType :: Attr NiceAgent Int
+proxyType = newAttrFromUIntProperty "proxy-type"
+
+proxyUsername :: Attr NiceAgent String
+proxyUsername = newAttrFromStringProperty "proxy-username"
+
+reliable :: Attr NiceAgent Bool
+reliable = newAttrFromBoolProperty "reliable"
+
+stunPacingtimer :: Attr NiceAgent Int
 stunPacingtimer = newAttrFromUIntProperty "stun-pacing-timer"
-stunServer      = newAttrFromStringProperty "stun-server"
+
+stunServer :: Attr NiceAgent String
+stunServer = newAttrFromStringProperty "stun-server"
+
+stunServerPort :: Attr NiceAgent Int
 stunServerPort  = newAttrFromUIntProperty "stun-server-port"
-upnp            = newAttrFromBoolProperty "upnp"
-upnpTimeout     = newAttrFromUIntProperty "upnp-timeout"
 
+upnp :: Attr NiceAgent Bool
+upnp = newAttrFromBoolProperty "upnp"
 
--- mainContext "main-context" :: ReadAttr NiceAgent (Ptr ())
+upnpTimeout :: Attr NiceAgent Int
+upnpTimeout = newAttrFromUIntProperty "upnp-timeout"
+
+-- Utilities
+
+peekGString :: Ptr CString -> IO String
+peekGString x = do
+  strp <- peek x
+  str <- peekCString strp
+  {#call g_free #} $ castPtr strp
+  return str
+
+gsListify :: Storable s => [s] -> (GSList -> IO b) -> IO b
+gsListify xs f = mapM new xs >>= flip withGSList f
+
+unGsListify :: Storable s => GSList -> IO [s]
+unGsListify = mapM peek <=< fromGSList
+
+dataP :: (Ptr a -> b) -> b
+dataP = ($ nullPtr)
+
+useAsCStringLen' :: ByteString -> ((CUInt, Ptr CChar) -> IO a) -> IO a
+useAsCStringLen' bs f = unsafeUseAsCStringLen bs (f . first fromIntegral . swap)
+
+withMainContext :: MainContext -> (Ptr a -> IO b) -> IO b
+withMainContext ctx f  = withForeignPtr (fromMainContext ctx) $ f . castPtr

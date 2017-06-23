@@ -8,6 +8,7 @@ module Network.Ice.Signals (
   connect_WORD_WORD_STRING__NONE,
   connect_WORD_WORD_STRING_STRING__NONE,
 
+  connect_PTR__NONE,
   ) where
 
 import Control.Monad	(liftM)
@@ -88,3 +89,18 @@ connect_WORD_WORD_STRING_STRING__NONE signal after obj user =
           peekUTFString str4 >>= \str4' ->
           peekUTFString str3 >>= \str3' ->
           user int1 int2 str3' str4'
+
+connect_PTR__NONE
+    :: GObjectClass obj
+    => Storable s
+    => SignalName
+    -> ConnectAfter
+    -> obj
+    -> (s -> IO ())
+    -> IO (ConnectId obj)
+connect_PTR__NONE signal after obj user =
+  connectGeneric signal after obj action
+  where action :: Ptr GObject -> Ptr () -> IO ()
+        action _ p =
+            failOnGError $
+                user =<< peek (castPtr p)
